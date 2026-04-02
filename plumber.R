@@ -20,7 +20,7 @@ normalize_email <- function(email) {
 }
 
 DB_PATH <- Sys.getenv("CBT_DB_PATH", unset = "cbt_admin.sqlite")
-ADMIN_API_KEY <- Sys.getenv("ADMIN_API_KEY", unset = "OcheAdminKey123")
+ADMIN_API_KEY <- "OcheAdminKey123"
 
 get_con <- function() {
   dbConnect(SQLite(), DB_PATH)
