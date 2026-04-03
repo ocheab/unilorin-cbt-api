@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     libsodium-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN R -e "install.packages(c('plumber','DBI','RSQLite','jsonlite'), repos='https://cloud.r-project.org')"
+RUN R -e "install.packages(c('plumber','DBI','RSQLite','jsonlite', 'httr2'), repos='https://cloud.r-project.org')"
 
 WORKDIR /app
 
