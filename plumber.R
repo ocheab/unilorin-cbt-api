@@ -7,10 +7,9 @@ library(plumber)
 library(DBI)
 library(RSQLite)
 library(jsonlite)
+library(httr2)
+library(digest)
 
-# =========================
-# HELPERS
-# =========================
 `%||%` <- function(x, y) {
   if (is.null(x) || length(x) == 0 || (is.character(x) && !nzchar(x))) y else x
 }
@@ -21,6 +20,10 @@ normalize_email <- function(email) {
 
 DB_PATH <- Sys.getenv("CBT_DB_PATH", unset = "cbt_admin.sqlite")
 ADMIN_API_KEY <- "OcheAdminKey123"
+
+PAYSTACK_SECRET_KEY <- Sys.getenv("PAYSTACK_SECRET_KEY", unset = "")
+APP_BASE_URL <- Sys.getenv("APP_BASE_URL", unset = "https://unilorin-cbt-api.onrender.com")
+EXPECTED_AMOUNT_KOBO <- 200000
 
 get_con <- function() {
   dbConnect(SQLite(), DB_PATH)
@@ -173,16 +176,84 @@ days_left_from_expiry <- function(expiry_text) {
   as.integer(ceiling(diff_secs / 86400))
 }
 
-# Initialize DB on startup
+paystack_verify_transaction <- function(reference) {
+  req <- request(paste0("https://api.paystack.co/transaction/verify/", reference)) |>
+    req_method("GET") |>
+    req_headers(
+      Authorization = paste("Bearer", PAYSTACK_SECRET_KEY)
+    )
+
+  resp <- req_perform(req)
+  fromJSON(resp_body_string(resp))
+}
+
 init_db()
 
 #* API health check
 #* @get /health
 #* @serializer json
 function() {
+  list(success = TRUE, message = "UniIlorin CBT API is running")
+}
+
+#* Initialize payment on backend
+#* @post /initialize-payment
+#* @serializer json
+function(req, res) {
+  if (!nzchar(PAYSTACK_SECRET_KEY)) {
+    res$status <- 500
+    return(list(success = FALSE, message = "PAYSTACK_SECRET_KEY is not configured"))
+  }
+
+  body <- tryCatch(fromJSON(req$postBody), error = function(e) list())
+  email <- normalize_email(body$email %||% "")
+  amount <- as.integer(body$amount %||% EXPECTED_AMOUNT_KOBO)
+
+  if (!nzchar(email)) {
+    res$status <- 400
+    return(list(success = FALSE, message = "Email is required"))
+  }
+
+  if (is.na(amount) || amount <= 0) {
+    amount <- EXPECTED_AMOUNT_KOBO
+  }
+
+  reference <- paste0("cbt_", as.integer(Sys.time()), "_", sample(1000:9999, 1))
+
+  pay_req <- request("https://api.paystack.co/transaction/initialize") |>
+    req_method("POST") |>
+    req_headers(
+      Authorization = paste("Bearer", PAYSTACK_SECRET_KEY),
+      `Content-Type` = "application/json"
+    ) |>
+    req_body_json(list(
+      email = email,
+      amount = amount,
+      currency = "NGN",
+      callback_url = paste0(APP_BASE_URL, "/payment-callback"),
+      reference = reference,
+      metadata = list(
+        app = "unilorin_cbt",
+        access_type = "full_access",
+        email = email
+      )
+    ))
+
+  out <- tryCatch({
+    resp <- req_perform(pay_req)
+    fromJSON(resp_body_string(resp))
+  }, error = function(e) {
+    NULL
+  })
+
+  if (is.null(out) || !isTRUE(out$status)) {
+    res$status <- 500
+    return(list(success = FALSE, message = "Payment initialization failed"))
+  }
+
   list(
     success = TRUE,
-    message = "UniIlorin CBT API is running"
+    data = out$data
   )
 }
 
@@ -266,20 +337,14 @@ function(req, res) {
 
   if (!nzchar(email)) {
     res$status <- 400
-    return(list(
-      success = FALSE,
-      message = "Email is required"
-    ))
+    return(list(success = FALSE, message = "Email is required"))
   }
 
   ok <- submit_transfer_claim_db(email, note)
 
   if (!ok) {
     res$status <- 500
-    return(list(
-      success = FALSE,
-      message = "Failed to submit transfer claim"
-    ))
+    return(list(success = FALSE, message = "Failed to submit transfer claim"))
   }
 
   list(
@@ -297,10 +362,7 @@ function(req, res) {
 
   if (!identical(admin_key, ADMIN_API_KEY)) {
     res$status <- 403
-    return(list(
-      success = FALSE,
-      message = "Unauthorized"
-    ))
+    return(list(success = FALSE, message = "Unauthorized"))
   }
 
   body <- tryCatch(fromJSON(req$postBody), error = function(e) list())
@@ -311,10 +373,7 @@ function(req, res) {
 
   if (!nzchar(email)) {
     res$status <- 400
-    return(list(
-      success = FALSE,
-      message = "Email is required"
-    ))
+    return(list(success = FALSE, message = "Email is required"))
   }
 
   if (is.na(days) || days <= 0) {
@@ -330,10 +389,7 @@ function(req, res) {
 
   if (!ok) {
     res$status <- 500
-    return(list(
-      success = FALSE,
-      message = "Failed to grant access"
-    ))
+    return(list(success = FALSE, message = "Failed to grant access"))
   }
 
   list(
@@ -342,4 +398,81 @@ function(req, res) {
     email = email,
     days = days
   )
+}
+
+#* Paystack webhook
+#* @post /paystack-webhook
+#* @serializer json
+function(req, res) {
+  if (!nzchar(PAYSTACK_SECRET_KEY)) {
+    res$status <- 500
+    return(list(success = FALSE, message = "PAYSTACK_SECRET_KEY is not configured"))
+  }
+
+  raw_body <- req$postBody %||% ""
+  signature <- req$HTTP_X_PAYSTACK_SIGNATURE %||% ""
+
+  computed_sig <- digest(
+    object = raw_body,
+    algo = "sha512",
+    serialize = FALSE,
+    key = PAYSTACK_SECRET_KEY
+  )
+
+  if (!nzchar(signature) || !identical(tolower(signature), tolower(computed_sig))) {
+    res$status <- 401
+    return(list(success = FALSE, message = "Invalid signature"))
+  }
+
+  event <- tryCatch(fromJSON(raw_body), error = function(e) NULL)
+
+  if (is.null(event)) {
+    res$status <- 400
+    return(list(success = FALSE, message = "Invalid JSON payload"))
+  }
+
+  event_name <- event$event %||% ""
+  data <- event$data %||% list()
+
+  reference <- data$reference %||% ""
+  email <- normalize_email(data$customer$email %||% data$metadata$email %||% "")
+  amount <- as.integer(data$amount %||% 0)
+  status <- tolower(data$status %||% "")
+
+  log_payment(
+    email = email,
+    reference = reference,
+    amount_kobo = amount,
+    status = status,
+    source = paste0("webhook:", event_name)
+  )
+
+  if (identical(event_name, "charge.success")) {
+    verified <- tryCatch(paystack_verify_transaction(reference), error = function(e) NULL)
+
+    if (!is.null(verified) &&
+        isTRUE(verified$status) &&
+        !is.null(verified$data) &&
+        identical(tolower(verified$data$status %||% ""), "success") &&
+        as.integer(verified$data$amount %||% 0) == EXPECTED_AMOUNT_KOBO) {
+
+      verified_email <- normalize_email(
+        verified$data$customer$email %||%
+          verified$data$metadata$email %||%
+          email
+      )
+
+      if (nzchar(verified_email)) {
+        upsert_user_access(
+          email = verified_email,
+          days = 365,
+          source = "paystack",
+          note = paste("Auto-granted after Paystack webhook:", reference)
+        )
+      }
+    }
+  }
+
+  res$status <- 200
+  list(success = TRUE)
 }
