@@ -19,8 +19,7 @@ normalize_email <- function(email) {
 }
 
 DB_PATH <- Sys.getenv("CBT_DB_PATH", unset = "cbt_admin.sqlite")
-ADMIN_API_KEY <- "OcheAdminKey123"
-
+ADMIN_API_KEY <- Sys.getenv("ADMIN_API_KEY", unset = "")
 PAYSTACK_SECRET_KEY <- Sys.getenv("PAYSTACK_SECRET_KEY", unset = "")
 APP_BASE_URL <- Sys.getenv("APP_BASE_URL", unset = "https://unilorin-cbt-api.onrender.com")
 EXPECTED_AMOUNT_KOBO <- 200000
@@ -196,6 +195,21 @@ function() {
   list(success = TRUE, message = "UniIlorin CBT API is running")
 }
 
+#* Optional callback landing route
+#* @get /payment-callback
+#* @serializer json
+function(req, res) {
+  reference <- req$argsQuery$reference %||% ""
+  trxref <- req$argsQuery$trxref %||% ""
+
+  list(
+    success = TRUE,
+    message = "Payment callback received. Please return to the app and check access.",
+    reference = reference,
+    trxref = trxref
+  )
+}
+
 #* Initialize payment on backend
 #* @post /initialize-payment
 #* @serializer json
@@ -243,6 +257,13 @@ function(req, res) {
     resp <- req_perform(pay_req)
     fromJSON(resp_body_string(resp))
   }, error = function(e) {
+    log_payment(
+      email = email,
+      reference = reference,
+      amount_kobo = amount,
+      status = paste0("initialize_error:", conditionMessage(e)),
+      source = "initialize-payment"
+    )
     NULL
   })
 
@@ -250,6 +271,14 @@ function(req, res) {
     res$status <- 500
     return(list(success = FALSE, message = "Payment initialization failed"))
   }
+
+  log_payment(
+    email = email,
+    reference = reference,
+    amount_kobo = amount,
+    status = "initialized",
+    source = "initialize-payment"
+  )
 
   list(
     success = TRUE,
@@ -347,6 +376,14 @@ function(req, res) {
     return(list(success = FALSE, message = "Failed to submit transfer claim"))
   }
 
+  log_payment(
+    email = email,
+    reference = "",
+    amount_kobo = NA,
+    status = "transfer_claim_submitted",
+    source = "submit-transfer-claim"
+  )
+
   list(
     success = TRUE,
     message = "Transfer claim submitted successfully",
@@ -360,7 +397,7 @@ function(req, res) {
 function(req, res) {
   admin_key <- req$HTTP_X_ADMIN_KEY %||% ""
 
-  if (!identical(admin_key, ADMIN_API_KEY)) {
+  if (!nzchar(ADMIN_API_KEY) || !identical(admin_key, ADMIN_API_KEY)) {
     res$status <- 403
     return(list(success = FALSE, message = "Unauthorized"))
   }
@@ -392,6 +429,14 @@ function(req, res) {
     return(list(success = FALSE, message = "Failed to grant access"))
   }
 
+  log_payment(
+    email = email,
+    reference = "",
+    amount_kobo = NA,
+    status = "manual_access_granted",
+    source = "grant-access"
+  )
+
   list(
     success = TRUE,
     message = "Access granted successfully",
@@ -420,6 +465,13 @@ function(req, res) {
   )
 
   if (!nzchar(signature) || !identical(tolower(signature), tolower(computed_sig))) {
+    log_payment(
+      email = "",
+      reference = "",
+      amount_kobo = NA,
+      status = "invalid_signature",
+      source = "paystack-webhook"
+    )
     res$status <- 401
     return(list(success = FALSE, message = "Invalid signature"))
   }
@@ -427,6 +479,13 @@ function(req, res) {
   event <- tryCatch(fromJSON(raw_body), error = function(e) NULL)
 
   if (is.null(event)) {
+    log_payment(
+      email = "",
+      reference = "",
+      amount_kobo = NA,
+      status = "invalid_json_payload",
+      source = "paystack-webhook"
+    )
     res$status <- 400
     return(list(success = FALSE, message = "Invalid JSON payload"))
   }
@@ -443,19 +502,62 @@ function(req, res) {
     email = email,
     reference = reference,
     amount_kobo = amount,
-    status = status,
+    status = paste0(status, " | event=", event_name),
     source = paste0("webhook:", event_name)
   )
 
   if (identical(event_name, "charge.success")) {
-    verified <- tryCatch(paystack_verify_transaction(reference), error = function(e) NULL)
+    verified <- tryCatch(paystack_verify_transaction(reference), error = function(e) e)
 
-    if (!is.null(verified) &&
-        isTRUE(verified$status) &&
-        !is.null(verified$data) &&
-        identical(tolower(verified$data$status %||% ""), "success") &&
-        as.integer(verified$data$amount %||% 0) == EXPECTED_AMOUNT_KOBO) {
-
+    if (inherits(verified, "error")) {
+      log_payment(
+        email = email,
+        reference = reference,
+        amount_kobo = amount,
+        status = paste0("verification_failed:", conditionMessage(verified)),
+        source = "webhook_verify"
+      )
+    } else if (is.null(verified)) {
+      log_payment(
+        email = email,
+        reference = reference,
+        amount_kobo = amount,
+        status = "verification_failed_null",
+        source = "webhook_verify"
+      )
+    } else if (!isTRUE(verified$status)) {
+      log_payment(
+        email = email,
+        reference = reference,
+        amount_kobo = amount,
+        status = "verify_status_false",
+        source = "webhook_verify"
+      )
+    } else if (is.null(verified$data)) {
+      log_payment(
+        email = email,
+        reference = reference,
+        amount_kobo = amount,
+        status = "verify_data_missing",
+        source = "webhook_verify"
+      )
+    } else if (tolower(verified$data$status %||% "") != "success") {
+      log_payment(
+        email = email,
+        reference = reference,
+        amount_kobo = as.integer(verified$data$amount %||% 0),
+        status = paste0("verified_not_success:", verified$data$status %||% ""),
+        source = "webhook_verify"
+      )
+    } else if (as.integer(verified$data$amount %||% 0) != EXPECTED_AMOUNT_KOBO) {
+      log_payment(
+        email = email,
+        reference = reference,
+        amount_kobo = as.integer(verified$data$amount %||% 0),
+        status = paste0("amount_mismatch_expected_", EXPECTED_AMOUNT_KOBO),
+        source = "webhook_verify"
+      )
+    } else {
       verified_email <- normalize_email(
         verified$data$customer$email %||%
           verified$data$metadata$email %||%
@@ -469,10 +571,71 @@ function(req, res) {
           source = "paystack",
           note = paste("Auto-granted after Paystack webhook:", reference)
         )
+
+        log_payment(
+          email = verified_email,
+          reference = reference,
+          amount_kobo = as.integer(verified$data$amount %||% 0),
+          status = "access_granted",
+          source = "webhook_verify"
+        )
+      } else {
+        log_payment(
+          email = email,
+          reference = reference,
+          amount_kobo = as.integer(verified$data$amount %||% 0),
+          status = "verified_but_email_missing",
+          source = "webhook_verify"
+        )
       }
     }
   }
 
   res$status <- 200
   list(success = TRUE)
+}
+
+#* Debug: recent payment logs
+#* @get /debug-payment-logs
+#* @serializer json
+function() {
+  con <- get_con()
+  on.exit(dbDisconnect(con), add = TRUE)
+
+  logs <- dbGetQuery(
+    con,
+    "SELECT * FROM payment_logs ORDER BY id DESC LIMIT 50"
+  )
+
+  list(success = TRUE, logs = logs)
+}
+
+#* Debug: recent users
+#* @get /debug-users
+#* @serializer json
+function() {
+  con <- get_con()
+  on.exit(dbDisconnect(con), add = TRUE)
+
+  users <- dbGetQuery(
+    con,
+    "SELECT * FROM users ORDER BY id DESC LIMIT 50"
+  )
+
+  list(success = TRUE, users = users)
+}
+
+#* Debug: recent transfer claims
+#* @get /debug-transfer-claims
+#* @serializer json
+function() {
+  con <- get_con()
+  on.exit(dbDisconnect(con), add = TRUE)
+
+  claims <- dbGetQuery(
+    con,
+    "SELECT * FROM transfer_claims ORDER BY id DESC LIMIT 50"
+  )
+
+  list(success = TRUE, claims = claims)
 }
