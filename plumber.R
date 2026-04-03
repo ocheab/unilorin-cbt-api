@@ -355,6 +355,118 @@ function(req, res) {
   )
 }
 
+#* Verify payment manually from reference and grant access if successful
+#* @post /verify-payment
+#* @serializer json
+function(req, res) {
+  if (!nzchar(PAYSTACK_SECRET_KEY)) {
+    res$status <- 500
+    return(list(success = FALSE, message = "PAYSTACK_SECRET_KEY is not configured"))
+  }
+
+  body <- tryCatch(fromJSON(req$postBody), error = function(e) list())
+
+  reference <- trimws(body$reference %||% "")
+  email <- normalize_email(body$email %||% "")
+
+  if (!nzchar(reference)) {
+    res$status <- 400
+    return(list(success = FALSE, message = "Reference is required"))
+  }
+
+  verified <- tryCatch(paystack_verify_transaction(reference), error = function(e) e)
+
+  if (inherits(verified, "error")) {
+    log_payment(
+      email = email,
+      reference = reference,
+      amount_kobo = NA,
+      status = paste0("manual_verify_error:", conditionMessage(verified)),
+      source = "verify-payment"
+    )
+
+    res$status <- 500
+    return(list(success = FALSE, message = "Payment verification failed"))
+  }
+
+  if (!isTRUE(verified$status) || is.null(verified$data)) {
+    log_payment(
+      email = email,
+      reference = reference,
+      amount_kobo = NA,
+      status = "manual_verify_invalid_response",
+      source = "verify-payment"
+    )
+
+    return(list(success = FALSE, message = "Invalid verification response"))
+  }
+
+  verified_status <- tolower(verified$data$status %||% "")
+  verified_amount <- as.integer(verified$data$amount %||% 0)
+  verified_email <- normalize_email(
+    verified$data$customer$email %||%
+      verified$data$metadata$email %||%
+      email
+  )
+
+  if (!identical(verified_status, "success")) {
+    log_payment(
+      email = verified_email,
+      reference = reference,
+      amount_kobo = verified_amount,
+      status = paste0("manual_verify_not_success:", verified_status),
+      source = "verify-payment"
+    )
+
+    return(list(success = FALSE, message = "Payment not successful yet"))
+  }
+
+  if (verified_amount != EXPECTED_AMOUNT_KOBO) {
+    log_payment(
+      email = verified_email,
+      reference = reference,
+      amount_kobo = verified_amount,
+      status = paste0("manual_verify_amount_mismatch_expected_", EXPECTED_AMOUNT_KOBO),
+      source = "verify-payment"
+    )
+
+    return(list(success = FALSE, message = "Payment amount does not match expected amount"))
+  }
+
+  if (!nzchar(verified_email)) {
+    log_payment(
+      email = email,
+      reference = reference,
+      amount_kobo = verified_amount,
+      status = "manual_verify_email_missing",
+      source = "verify-payment"
+    )
+
+    return(list(success = FALSE, message = "Verified payment but email is missing"))
+  }
+
+  upsert_user_access(
+    email = verified_email,
+    days = 365,
+    source = "paystack_manual_verify",
+    note = paste("Granted after manual verify:", reference)
+  )
+
+  log_payment(
+    email = verified_email,
+    reference = reference,
+    amount_kobo = verified_amount,
+    status = "manual_verify_access_granted",
+    source = "verify-payment"
+  )
+
+  list(
+    success = TRUE,
+    message = "Payment verified and access granted",
+    email = verified_email
+  )
+}
+
 #* Submit a transfer/manual payment claim for admin review
 #* @post /submit-transfer-claim
 #* @serializer json
