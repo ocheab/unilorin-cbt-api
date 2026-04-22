@@ -69,6 +69,22 @@ init_db <- function() {
   ")
 }
 
+
+#* @filter cors
+function(req, res) {
+  res$setHeader("Access-Control-Allow-Origin", "*")
+  res$setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key")
+  res$setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+
+  if (req$REQUEST_METHOD == "OPTIONS") {
+    res$status <- 200
+    return(list())
+  }
+
+  plumber::forward()
+}
+
+
 get_user_by_email <- function(email) {
   email <- normalize_email(email)
   if (!nzchar(email)) return(NULL)
